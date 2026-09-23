@@ -1,0 +1,225 @@
+import { env } from 'cloudflare:workers';
+import { getChatGPTUser, type ChatGPTUser } from '@/app/chatgpt-auth';
+import type { Member, PortalState } from './types';
+import { canBook, makeSlots, safeUrl } from './rules';
+export class ApiError extends Error {
+    constructor(message: string, public status = 400) { super(message); }
+}
+export function database() { if (!env.DB)
+    throw new ApiError('The database is not available. Please try again shortly.', 503); return env.DB; }
+async function rows<T>(sql: string, ...args: unknown[]): Promise<T[]> { return (await database().prepare(sql).bind(...args).all<T>()).results; }
+async function one<T>(sql: string, ...args: unknown[]): Promise<T | null> { return database().prepare(sql).bind(...args).first<T>(); }
+export async function identity() { const user = await getChatGPTUser(); if (!user)
+    throw new ApiError('Sign in to continue.', 401); return user; }
+async function membership(user: ChatGPTUser) { return one<Member>('SELECT user_id,group_id,role,name,email FROM members WHERE user_id=?', user.userId); }
+function field(v: unknown, label: string, max = 2000) { if (typeof v !== 'string' || !v.trim() || v.trim().length > max)
+    throw new ApiError(`${label} is required (maximum ${max} characters).`); return v.trim(); }
+function mentor(m: Member) { if (m.role !== 'mentor')
+    throw new ApiError('Only your mentor can make that change.', 403); }
+async function hash(code: string) { return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(code.toUpperCase().replace(/[^A-Z0-9]/g, ''))))).map(x => x.toString(16).padStart(2, '0')).join(''); }
+export async function state(user: ChatGPTUser): Promise<PortalState> {
+    const member = await membership(user);
+    const empty = { member: null, people: [], slots: [], meetings: [], announcements: [], messages: [], resources: [], invites: [], emailReady: !!(env.RESEND_API_KEY && env.EMAIL_FROM), emailPending: 0 };
+    if (!member)
+        return empty;
+    const g = member.group_id;
+    const isMentor = member.role === 'mentor';
+    const [group, people, slots, meetings, announcements, messages, resources, invites, pending] = await Promise.all([
+        one<{
+            id: string;
+            name: string;
+        }>('SELECT id,name FROM groups WHERE id=?', g),
+        rows<Member>(isMentor ? 'SELECT user_id,group_id,role,name,email FROM members WHERE group_id=?' : 'SELECT user_id,group_id,role,name,email FROM members WHERE group_id=? AND (user_id=? OR role=\'mentor\')', ...(isMentor ? [g] : [g, member.user_id])),
+        rows<PortalState['slots'][number]>(`SELECT s.*,EXISTS(SELECT 1 FROM meetings m WHERE m.slot_id=s.id AND m.status='confirmed') AS taken FROM slots s WHERE s.group_id=? AND s.status='published' AND s.end>? ORDER BY s.start`, g, Date.now()),
+        rows<PortalState['meetings'][number]>(`SELECT m.*,s.start,s.end,u.name AS mentee_name FROM meetings m JOIN slots s ON s.id=m.slot_id JOIN members u ON u.user_id=m.mentee_id WHERE m.group_id=? ${isMentor ? '' : 'AND m.mentee_id=?'} ORDER BY s.start`, ...(isMentor ? [g] : [g, member.user_id])),
+        rows<PortalState['announcements'][number]>(`SELECT a.* ${isMentor ? ",(SELECT COUNT(*) FROM email_jobs e WHERE e.announcement_id=a.id AND e.status='sent') AS sent,(SELECT COUNT(*) FROM email_jobs e WHERE e.announcement_id=a.id AND e.status!='sent') AS pending" : ''} FROM announcements a WHERE a.group_id=? ORDER BY a.created_at DESC`, g),
+        rows<PortalState['messages'][number]>(`SELECT m.*,a.title AS announcement_title FROM messages m LEFT JOIN announcements a ON a.id=m.announcement_id WHERE m.group_id=? ${isMentor ? '' : 'AND m.mentee_id=?'} ORDER BY m.created_at`, ...(isMentor ? [g] : [g, member.user_id])),
+        rows<PortalState['resources'][number]>('SELECT * FROM resources WHERE group_id=? ORDER BY created_at DESC', g),
+        isMentor ? rows<PortalState['invites'][number]>('SELECT hash,email,name,expires_at,revoked,used_by FROM invites WHERE group_id=? ORDER BY created_at DESC', g) : [],
+        isMentor ? one<{
+            n: number;
+        }>("SELECT COUNT(*) AS n FROM email_jobs WHERE group_id=? AND status!='sent'", g) : null,
+    ]);
+    return { ...empty, member, group: group ?? undefined, people, slots, meetings, announcements, messages, resources, invites, emailPending: pending?.n ?? 0 };
+}
+export async function act(user: ChatGPTUser, input: Record<string, unknown>) {
+    const db = database(), now = Date.now();
+    const action = field(input.action, 'Action', 40);
+    let m = await membership(user);
+    if (action === 'create-group') {
+        if (m)
+            throw new ApiError('You already belong to a mentoring space.');
+        const name = field(input.name, 'Your name', 80), title = field(input.title, 'Space name', 100), id = crypto.randomUUID();
+        await db.batch([db.prepare('INSERT INTO groups (id,mentor_id,name,created_at) VALUES (?,?,?,?)').bind(id, user.userId, title, now), db.prepare("INSERT INTO members(user_id,group_id,role,name,email,created_at) VALUES (?,?,'mentor',?,?,?)").bind(user.userId, id, name, user.email.toLowerCase(), now)]);
+        return { message: 'Your mentoring space is ready.' };
+    }
+    if (action === 'join') {
+        if (m)
+            throw new ApiError('You already belong to a mentoring space.');
+        const code = field(input.code, 'Invite code', 80), name = field(input.name, 'Your name', 80), h = await hash(code);
+        const result = await db.batch([
+            db.prepare("INSERT INTO members(user_id,group_id,role,name,email,invite_hash,created_at) SELECT ?,group_id,'mentee',?,?,hash,? FROM invites WHERE hash=? AND email=? AND expires_at>? AND revoked=0 AND used_by IS NULL").bind(user.userId, name, user.email.toLowerCase(), now, h, user.email.toLowerCase(), now),
+            db.prepare('UPDATE invites SET used_by=? WHERE hash=? AND used_by IS NULL AND EXISTS(SELECT 1 FROM members WHERE user_id=? AND invite_hash=?)').bind(user.userId, h, user.userId, h),
+        ]);
+        if (!result[0].meta.changes)
+            throw new ApiError('This code is invalid, expired, used, or assigned to a different email address.');
+        return { message: 'Welcome to your mentoring space.' };
+    }
+    if (!m)
+        throw new ApiError('Create a space or join using your mentor’s invite code.', 403);
+    const g = m.group_id;
+    if (action === 'invite') {
+        mentor(m);
+        const email = field(input.email, 'Email', 254).toLowerCase(), name = field(input.name, 'Mentee name', 80);
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+            throw new ApiError('Enter a valid email address.');
+        const raw = Array.from(crypto.getRandomValues(new Uint8Array(16))).map(n => n.toString(16).padStart(2, '0')).join('').toUpperCase();
+        const code = raw.match(/.{1,4}/g)!.join('-');
+        await db.prepare('INSERT INTO invites(hash,group_id,email,name,expires_at,created_at) VALUES (?,?,?,?,?,?)').bind(await hash(code), g, email, name, now + 7 * 86400000, now).run();
+        return { message: 'Invite created. Copy the code now; it will only be shown once.', code };
+    }
+    if (action === 'revoke-invite') {
+        mentor(m);
+        await db.prepare('UPDATE invites SET revoked=1 WHERE hash=? AND group_id=? AND used_by IS NULL').bind(field(input.hash, 'Invite'), g).run();
+        return { message: 'Invite revoked.' };
+    }
+    if (action === 'publish-slots') {
+        mentor(m);
+        const format = field(input.format, 'Format', 20);
+        if (!['online', 'in-person', 'both'].includes(format))
+            throw new ApiError('Choose a valid format.');
+        let slots;
+        try {
+            slots = makeSlots(field(input.day, 'Date', 10), field(input.from, 'Start time', 5), field(input.to, 'End time', 5), Number(input.duration));
+        }
+        catch (e) {
+            throw new ApiError((e as Error).message);
+        }
+        await db.batch(slots.map(s => db.prepare("INSERT INTO slots(id,group_id,start,end,format,status) VALUES (?,?,?,?,?,'published')").bind(crypto.randomUUID(), g, s.start, s.end, format)));
+        return { message: `${slots.length} meeting slots published.` };
+    }
+    if (action === 'withdraw-slot') {
+        mentor(m);
+        const r = await db.prepare("UPDATE slots SET status='withdrawn' WHERE id=? AND group_id=? AND NOT EXISTS(SELECT 1 FROM meetings WHERE slot_id=slots.id AND status='confirmed')").bind(field(input.id, 'Slot'), g).run();
+        if (!r.meta.changes)
+            throw new ApiError('This slot is booked or unavailable. Cancel the meeting before removing its availability.');
+        return { message: 'Availability removed.' };
+    }
+    if (action === 'book') {
+        if (m.role !== 'mentee')
+            throw new ApiError('Meetings are booked from a mentee account.', 403);
+        const slot = await one<{
+            id: string;
+            start: number;
+            format: string;
+        }>("SELECT id,start,format FROM slots WHERE id=? AND group_id=? AND status='published'", field(input.slotId, 'Slot'), g);
+        if (!slot || !canBook(slot.start))
+            throw new ApiError('Choose an available slot at least 72 hours from now.');
+        const format = field(input.format, 'Format', 20);
+        if (!['online', 'in-person'].includes(format) || (slot.format !== 'both' && slot.format !== format))
+            throw new ApiError('This meeting format is not offered for that slot.');
+        const location = format === 'in-person' ? field(input.location, 'In-person location', 250) : '';
+        await db.prepare("INSERT INTO meetings(id,group_id,slot_id,mentee_id,format,location,agenda,status,created_at) VALUES (?,?,?,?,?,?,?,'confirmed',?)").bind(crypto.randomUUID(), g, slot.id, m.user_id, format, location, field(input.agenda, 'Discussion topic', 2000), now).run();
+        return { message: 'Meeting confirmed. You can find the details in My meetings.' };
+    }
+    if (action === 'cancel') {
+        const r = await db.prepare(`UPDATE meetings SET status='cancelled' WHERE id=? AND group_id=? AND status='confirmed' AND EXISTS(SELECT 1 FROM slots WHERE slots.id=meetings.slot_id AND slots.start>?) ${m.role === 'mentor' ? '' : 'AND mentee_id=?'}`).bind(...(m.role === 'mentor' ? [field(input.id, 'Meeting'), g, now] : [field(input.id, 'Meeting'), g, now, m.user_id])).run();
+        if (!r.meta.changes)
+            throw new ApiError('That meeting cannot be cancelled.');
+        return { message: 'Meeting cancelled. The slot is available again if it meets the booking notice.' };
+    }
+    if (action === 'meeting-link') {
+        mentor(m);
+        let link;
+        try {
+            link = safeUrl(field(input.link, 'Meeting link', 1500));
+        }
+        catch (e) {
+            throw new ApiError((e as Error).message);
+        }
+        const r = await db.prepare("UPDATE meetings SET link=? WHERE id=? AND group_id=? AND format='online' AND status='confirmed'").bind(link, field(input.id, 'Meeting'), g).run();
+        if (!r.meta.changes)
+            throw new ApiError('Meeting not found.');
+        return { message: 'Meeting link saved.' };
+    }
+    if (action === 'message') {
+        const menteeId = m.role === 'mentee' ? m.user_id : field(input.menteeId, 'Mentee');
+        if (!await one("SELECT user_id FROM members WHERE user_id=? AND group_id=? AND role='mentee'", menteeId, g))
+            throw new ApiError('Conversation not found.', 404);
+        const announcementId = input.announcementId ? field(input.announcementId, 'Announcement') : null;
+        if (announcementId && !await one('SELECT id FROM announcements WHERE id=? AND group_id=?', announcementId, g))
+            throw new ApiError('Announcement not found.', 404);
+        await db.prepare('INSERT INTO messages(id,group_id,mentee_id,sender_id,body,announcement_id,created_at) VALUES (?,?,?,?,?,?,?)').bind(crypto.randomUUID(), g, menteeId, m.user_id, field(input.body, 'Message', 5000), announcementId, now).run();
+        return { message: 'Private message sent.' };
+    }
+    if (action === 'announce') {
+        mentor(m);
+        const id = crypto.randomUUID(), title = field(input.title, 'Title', 150), body = field(input.body, 'Announcement', 10000);
+        await db.batch([db.prepare('INSERT INTO announcements(id,group_id,title,body,created_at) VALUES (?,?,?,?,?)').bind(id, g, title, body, now), db.prepare("INSERT INTO email_jobs(id,group_id,announcement_id,recipient,subject,body,created_at) SELECT ?||':'||user_id,group_id,?,email,?,?,? FROM members WHERE group_id=? AND role='mentee'").bind(id, id, `[SciMentor] ${title}`, `${body}\n\n— ${m.name}\nPlease reply privately through your SciMentor portal.`, now, g)]);
+        const mail = await deliverEmails(g);
+        return { message: mail.configured ? 'Announcement published. Email delivery status is shown on the announcement.' : 'Announcement published. Emails are queued until the email service is connected.' };
+    }
+    if (action === 'retry-email') {
+        mentor(m);
+        const r = await deliverEmails(g);
+        if (!r.configured)
+            throw new ApiError('Email delivery needs a verified sender and an email service connection.', 503);
+        return { message: 'Email delivery attempted. Check the announcement status.' };
+    }
+    if (action === 'resource') {
+        mentor(m);
+        const kind = field(input.kind, 'Type', 20);
+        if (!['faq', 'resource'].includes(kind))
+            throw new ApiError('Choose FAQ or resource.');
+        let url = '';
+        if (kind === 'resource') {
+            try {
+                url = safeUrl(field(input.url, 'Resource link', 1500));
+            }
+            catch (e) {
+                throw new ApiError((e as Error).message);
+            }
+        }
+        await db.prepare('INSERT INTO resources(id,group_id,kind,title,body,url,category,created_at) VALUES (?,?,?,?,?,?,?,?)').bind(crypto.randomUUID(), g, kind, field(input.title, kind === 'faq' ? 'Question' : 'Title', 200), field(input.body, kind === 'faq' ? 'Answer' : 'Description', 10000), url, field(input.category, 'Category', 60), now).run();
+        return { message: kind === 'faq' ? 'FAQ published.' : 'Resource added.' };
+    }
+    if (action === 'delete-resource') {
+        mentor(m);
+        await db.prepare('DELETE FROM resources WHERE id=? AND group_id=?').bind(field(input.id, 'Resource'), g).run();
+        return { message: 'Resource removed.' };
+    }
+    throw new ApiError('Unknown action.');
+}
+type EmailJob = {
+    id: string;
+    recipient: string;
+    subject: string;
+    body: string;
+    first_attempt_at: number | null;
+};
+export async function deliverEmails(groupId?: string) {
+    if (!env.RESEND_API_KEY || !env.EMAIL_FROM)
+        return { configured: false };
+    const db = database(), now = Date.now();
+    const jobs = await rows<EmailJob>(`SELECT id,recipient,subject,body,first_attempt_at FROM email_jobs WHERE status IN ('pending','retry','sending') AND (lease_until IS NULL OR lease_until<?) ${groupId ? 'AND group_id=?' : ''} ORDER BY created_at LIMIT 20`, ...(groupId ? [now, groupId] : [now]));
+    for (const job of jobs) {
+        // Resend's idempotency window is finite: older uncertain sends need reconciliation.
+        if (job.first_attempt_at && now - job.first_attempt_at > 23 * 3600000) {
+            await db.prepare("UPDATE email_jobs SET status='review',error='Delivery needs manual reconciliation before retrying.' WHERE id=?").bind(job.id).run();
+            continue;
+        }
+        const claim = await db.prepare("UPDATE email_jobs SET status='sending',lease_until=?,attempts=attempts+1,first_attempt_at=COALESCE(first_attempt_at,?) WHERE id=? AND status IN ('pending','retry','sending') AND (lease_until IS NULL OR lease_until<?)").bind(now + 120000, now, job.id, now).run();
+        if (!claim.meta.changes)
+            continue;
+        try {
+            const response = await fetch('https://api.resend.com/emails', { method: 'POST', headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': job.id }, body: JSON.stringify({ from: env.EMAIL_FROM, to: [job.recipient], subject: job.subject, text: job.body }), signal: AbortSignal.timeout(12000) });
+            if (!response.ok)
+                throw new Error(`Email provider returned ${response.status}.`);
+            await db.prepare("UPDATE email_jobs SET status='sent',lease_until=NULL,error=NULL WHERE id=?").bind(job.id).run();
+        }
+        catch (e) {
+            await db.prepare("UPDATE email_jobs SET status='retry',lease_until=NULL,error=? WHERE id=?").bind((e as Error).message.slice(0, 200), job.id).run();
+        }
+    }
+    return { configured: true };
+}
