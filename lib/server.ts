@@ -1,23 +1,23 @@
-import { env } from 'cloudflare:workers';
-import { getChatGPTUser, type ChatGPTUser } from '@/app/chatgpt-auth';
+import { getDatabase } from '@/db';
+const env = process.env;
+import { getServerUser, type AuthUser } from '@/lib/auth';
 import type { Member, PortalState } from './types';
 import { canBook, makeSlots, safeUrl } from './rules';
 export class ApiError extends Error {
     constructor(message: string, public status = 400) { super(message); }
 }
-export function database() { if (!env.DB)
-    throw new ApiError('The database is not available. Please try again shortly.', 503); return env.DB; }
+export function database() { return getDatabase(); }
 async function rows<T>(sql: string, ...args: unknown[]): Promise<T[]> { return (await database().prepare(sql).bind(...args).all<T>()).results; }
 async function one<T>(sql: string, ...args: unknown[]): Promise<T | null> { return database().prepare(sql).bind(...args).first<T>(); }
-export async function identity() { const user = await getChatGPTUser(); if (!user)
+export async function identity() { const user = await getServerUser(); if (!user)
     throw new ApiError('Sign in to continue.', 401); return user; }
-async function membership(user: ChatGPTUser) { return one<Member>('SELECT user_id,group_id,role,name,email FROM members WHERE user_id=?', user.userId); }
+async function membership(user: AuthUser) { return one<Member>('SELECT user_id,group_id,role,name,email FROM members WHERE user_id=?', user.userId); }
 function field(v: unknown, label: string, max = 2000) { if (typeof v !== 'string' || !v.trim() || v.trim().length > max)
     throw new ApiError(`${label} is required (maximum ${max} characters).`); return v.trim(); }
 function mentor(m: Member) { if (m.role !== 'mentor')
     throw new ApiError('Only your mentor can make that change.', 403); }
 async function hash(code: string) { return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(code.toUpperCase().replace(/[^A-Z0-9]/g, ''))))).map(x => x.toString(16).padStart(2, '0')).join(''); }
-export async function state(user: ChatGPTUser): Promise<PortalState> {
+export async function state(user: AuthUser): Promise<PortalState> {
     const member = await membership(user);
     const empty = { member: null, people: [], slots: [], meetings: [], announcements: [], messages: [], resources: [], invites: [], emailReady: !!(env.RESEND_API_KEY && env.EMAIL_FROM), emailPending: 0 };
     if (!member)
@@ -30,7 +30,7 @@ export async function state(user: ChatGPTUser): Promise<PortalState> {
             name: string;
         }>('SELECT id,name FROM groups WHERE id=?', g),
         rows<Member>(isMentor ? 'SELECT user_id,group_id,role,name,email FROM members WHERE group_id=?' : 'SELECT user_id,group_id,role,name,email FROM members WHERE group_id=? AND (user_id=? OR role=\'mentor\')', ...(isMentor ? [g] : [g, member.user_id])),
-        rows<PortalState['slots'][number]>(`SELECT s.*,EXISTS(SELECT 1 FROM meetings m WHERE m.slot_id=s.id AND m.status='confirmed') AS taken FROM slots s WHERE s.group_id=? AND s.status='published' AND s.end>? ORDER BY s.start`, g, Date.now()),
+        rows<PortalState['slots'][number]>(`SELECT s.*,CAST(EXISTS(SELECT 1 FROM meetings m WHERE m.slot_id=s.id AND m.status='confirmed') AS integer) AS taken FROM slots s WHERE s.group_id=? AND s.status='published' AND s.end>? ORDER BY s.start`, g, Date.now()),
         rows<PortalState['meetings'][number]>(`SELECT m.*,s.start,s.end,u.name AS mentee_name FROM meetings m JOIN slots s ON s.id=m.slot_id JOIN members u ON u.user_id=m.mentee_id WHERE m.group_id=? ${isMentor ? '' : 'AND m.mentee_id=?'} ORDER BY s.start`, ...(isMentor ? [g] : [g, member.user_id])),
         rows<PortalState['announcements'][number]>(`SELECT a.* ${isMentor ? ",(SELECT COUNT(*) FROM email_jobs e WHERE e.announcement_id=a.id AND e.status='sent') AS sent,(SELECT COUNT(*) FROM email_jobs e WHERE e.announcement_id=a.id AND e.status!='sent') AS pending" : ''} FROM announcements a WHERE a.group_id=? ORDER BY a.created_at DESC`, g),
         rows<PortalState['messages'][number]>(`SELECT m.*,a.title AS announcement_title FROM messages m LEFT JOIN announcements a ON a.id=m.announcement_id WHERE m.group_id=? ${isMentor ? '' : 'AND m.mentee_id=?'} ORDER BY m.created_at`, ...(isMentor ? [g] : [g, member.user_id])),
@@ -42,7 +42,7 @@ export async function state(user: ChatGPTUser): Promise<PortalState> {
     ]);
     return { ...empty, member, group: group ?? undefined, people, slots, meetings, announcements, messages, resources, invites, emailPending: pending?.n ?? 0 };
 }
-export async function act(user: ChatGPTUser, input: Record<string, unknown>) {
+export async function act(user: AuthUser, input: Record<string, unknown>) {
     const db = database(), now = Date.now();
     const action = field(input.action, 'Action', 40);
     let m = await membership(user);

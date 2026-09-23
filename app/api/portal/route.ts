@@ -6,9 +6,9 @@ function failure(error: unknown) {
         return Response.json({ error: error.message }, { status: error.status, headers });
     const message = String(error);
     console.error('SciMentor request failed', message);
-    if (/slot_overlap|UNIQUE constraint failed: meetings.slot_id|slot_unavailable|booking_notice|meeting_overlap|invalid_booking/i.test(message))
+    if (/slot_overlap|idx_meetings_active_slot|slot_unavailable|booking_notice|meeting_overlap|invalid_booking/i.test(message))
         return Response.json({ error: 'That time is no longer available or overlaps another slot. Choose a different time.' }, { status: 409, headers });
-    if (/UNIQUE constraint/i.test(message))
+    if (/duplicate key|unique constraint/i.test(message))
         return Response.json({ error: 'This record already exists. Refresh and try again.' }, { status: 409, headers });
     return Response.json({ error: 'We could not complete that request. Your input has been kept; please try again.' }, { status: 503, headers });
 }

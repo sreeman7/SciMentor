@@ -1,4 +1,4 @@
-import { env } from 'cloudflare:workers';
+const env = process.env;
 import { deliverEmails } from '@/lib/server';
 export async function POST(request: Request) {
     if (!env.EMAIL_JOB_SECRET || request.headers.get('authorization') !== `Bearer ${env.EMAIL_JOB_SECRET}`)

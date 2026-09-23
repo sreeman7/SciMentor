@@ -1,21 +1,25 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { DatabaseSync } from 'node:sqlite';
+import { PGlite } from '@electric-sql/pglite';
+import { createDatabase } from '../db/query.ts';
 import { readFileSync } from 'node:fs';
 import { build } from 'esbuild';
 import { canBook, NOTICE_MS, makeSlots, zonedTimestamp, dateKey, shiftDay } from '../lib/rules.ts';
-const sql=readFileSync(new URL('../drizzle/0000_worried_silk_fever.sql',import.meta.url),'utf8');
-class D1 {
- constructor(){this.db=new DatabaseSync(':memory:');this.db.exec('PRAGMA foreign_keys=ON;');this.db.exec(sql);}
- prepare(text){const db=this.db;let values=[];const statement={bind(...args){values=args;return statement;},async first(){return db.prepare(text).get(...values)??null;},async all(){return {results:db.prepare(text).all(...values)};},async run(){const r=db.prepare(text).run(...values);return {success:true,meta:{changes:Number(r.changes)}};}};return statement;}
- async batch(statements){this.db.exec('BEGIN');try{const results=[];for(const s of statements)results.push(await s.run());this.db.exec('COMMIT');return results;}catch(e){this.db.exec('ROLLBACK');throw e;}}
+const sql=readFileSync(new URL('../supabase/migrations/001_initial.sql',import.meta.url),'utf8');
+let pg;
+async function testDatabase() {
+ if(pg) await pg.close();
+ pg=new PGlite();await pg.exec(sql);
+ const query=client=>async(text,values)=>{const r=await client.query(text,values);return {rows:r.rows,rowCount:r.affectedRows??0};};
+ return createDatabase(query(pg),fn=>pg.transaction(tx=>fn(query(tx))));
 }
-const bundled=await build({entryPoints:['lib/server.ts'],bundle:true,write:false,format:'esm',platform:'node',plugins:[{name:'test-bindings',setup(b){b.onResolve({filter:/^(cloudflare:workers|@\/app\/chatgpt-auth)$/},a=>({path:a.path,namespace:'mock'}));b.onLoad({filter:/.*/,namespace:'mock'},a=>({contents:a.path==='cloudflare:workers'?'export const env=globalThis.__scimentorTestEnv;':'export async function getChatGPTUser(){return globalThis.__scimentorTestUser??null}'}));}}]});
+const bundled=await build({entryPoints:['lib/server.ts'],bundle:true,write:false,format:'esm',platform:'node',plugins:[{name:'test-bindings',setup(b){b.onResolve({filter:/^(@\/db|@\/lib\/auth)$/},a=>({path:a.path,namespace:'mock'}));b.onLoad({filter:/.*/,namespace:'mock'},a=>({contents:a.path==='@/db'?'export function getDatabase(){return globalThis.__scimentorTestEnv.DB}':'export async function getServerUser(){return globalThis.__scimentorTestUser??null}'}));}}]});
 globalThis.__scimentorTestEnv={};
-const {act,state}=await import('data:text/javascript;base64,'+Buffer.from(bundled.outputFiles[0].text).toString('base64'));
+delete process.env.RESEND_API_KEY;delete process.env.EMAIL_FROM;
+const {act,state,identity}=await import('data:text/javascript;base64,'+Buffer.from(bundled.outputFiles[0].text).toString('base64'));
 const user=(id)=>({userId:id,email:`${id}@example.test`,displayName:id,fullName:id});
 const mentor=user('mentor'),other=user('other'),alice=user('alice'),bob=user('bob'),outsider=user('outsider');
-async function setup(){const db=new D1();globalThis.__scimentorTestEnv.DB=db;await act(mentor,{action:'create-group',name:'Mentor',title:'Science'});await act(other,{action:'create-group',name:'Other mentor',title:'Other space'});for(const u of [alice,bob]){const inv=await act(mentor,{action:'invite',name:u.userId,email:u.email});await act(u,{action:'join',name:u.userId,code:inv.code});}return db;}
+async function setup(){const db=await testDatabase();globalThis.__scimentorTestEnv.DB=db;await act(mentor,{action:'create-group',name:'Mentor',title:'Science'});await act(other,{action:'create-group',name:'Other mentor',title:'Other space'});for(const u of [alice,bob]){const inv=await act(mentor,{action:'invite',name:u.userId,email:u.email});await act(u,{action:'join',name:u.userId,code:inv.code});}return db;}
 const day=shiftDay(dateKey(Date.now()),7);
 test('72-hour boundary, Edmonton DST, and week-specific slots',()=>{
  const now=100000;assert.equal(canBook(now+NOTICE_MS,now),true);assert.equal(canBook(now+NOTICE_MS-1,now),false);
@@ -73,4 +77,15 @@ test('resources require mentor ownership and safe URLs',async()=>{
  assert.equal((await state(alice)).resources.length,1);assert.equal((await state(other)).resources.length,0);
  await assert.rejects(()=>act(mentor,{action:'resource',kind:'resource',title:'Bad link',body:'Bad',category:'General',url:'javascript:alert(1)'}),/https/);
  await assert.rejects(async()=>act(alice,{action:'delete-resource',id:(await state(alice)).resources[0].id}),/Only your mentor/);
+});
+
+test('private database schema denies access without explicit grants', async()=>{
+ await setup(); await pg.exec('CREATE ROLE scimentor_unauthorized; SET ROLE scimentor_unauthorized;');
+ try { await assert.rejects(()=>pg.query('SELECT * FROM scimentor.messages'),/permission denied/); } finally { await pg.exec('RESET ROLE'); await pg.close(); pg=null; }
+});
+
+test("anonymous requests cannot obtain a portal identity",async()=>{
+ globalThis.__scimentorTestUser=null;await assert.rejects(()=>identity(),/Sign in/);
+ globalThis.__scimentorTestUser=user("verified");assert.equal((await identity()).userId,"verified");
+ globalThis.__scimentorTestUser=null;
 });
