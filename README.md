@@ -46,7 +46,7 @@ The server attempts announcement delivery immediately and offers a manual retry.
 
 All application tables live in the **private `scimentor` schema**, with no public grants and row-level security enabled. Browser clients cannot query these tables directly. The server uses `DATABASE_URL`; every API operation checks the verified Supabase user, their membership, their role, and the relevant conversation or booking participants. Do not grant browser roles access to this schema.
 
-Availability changes and booking inserts lock the mentor group row within their transactions; database triggers check overlaps and the 72-hour rule. A unique partial index permits only one confirmed booking per slot. Existing booked availability cannot be withdrawn silently. Cancellation is explicit; rescheduling currently means cancelling and booking a new eligible slot.
+Availability changes and booking inserts lock the mentor group row within their transactions; database triggers check overlaps and the 72-hour rule. A unique partial index permits only one confirmed booking per slot. Existing booked availability cannot be withdrawn silently. Mentors and the booked mentee can reschedule a future meeting to another published slot with 72 hours’ notice. Cancellation and the replacement booking succeed together in one SQL statement; if the new slot is unavailable, the original stays confirmed. The old booking stays in the meeting list as cancelled, the discussion topic carries over, and online links must be added for the new time. Mentors can add or edit online links; only the meeting participants can see them.
 
 ## Verification
 

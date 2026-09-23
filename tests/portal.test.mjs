@@ -54,6 +54,55 @@ test('bookings enforce privacy, location, role, notice, atomic conflicts, and ca
  assert.equal(choices.filter(x=>x.status==='fulfilled').length,1);
  await assert.rejects(()=>db.prepare("INSERT INTO meetings(id,group_id,slot_id,mentee_id,format,agenda,created_at) VALUES ('direct',?,'near',?,'online','too soon',?)").bind(group,alice.userId,Date.now()).run(),/booking_notice/);
 });
+test('rescheduling is atomic, private, and preserves booking rules', async()=>{
+ const db=await setup();
+ await act(mentor,{action:'publish-slots',day,from:'13:00',to:'16:00',duration:30,format:'both'});
+ const slots=(await state(alice)).slots;
+ await act(alice,{action:'book',slotId:slots[0].id,format:'online',agenda:'Original private topic'});
+ await act(bob,{action:'book',slotId:slots[1].id,format:'online',agenda:'Bob topic'});
+ const old=(await state(alice)).meetings[0];
+ const move=(who,slotId,extra={})=>act(who,{action:'reschedule',id:old.id,slotId,format:'online',...extra});
+ await act(mentor,{action:'meeting-link',id:old.id,link:'https://meet.google.com/old-link'});
+ await assert.rejects(()=>move(bob,slots[2].id),/cannot be rescheduled/);
+ await assert.rejects(()=>move(other,slots[2].id),/available slot/);
+ await assert.rejects(()=>move(alice,slots[0].id),/cannot be rescheduled/);
+ await assert.rejects(()=>move(alice,slots[1].id),/meeting_overlap|unique/i);
+ assert.equal((await state(alice)).meetings[0].status,'confirmed','failed replacement keeps original');
+ await assert.rejects(()=>move(alice,slots[2].id,{format:'in-person',location:''}),/location/);
+ const group=(await state(mentor)).group.id,near=Date.now()+3600000;
+ await db.prepare('INSERT INTO slots(id,group_id,start,end,format) VALUES (?,?,?,?,?)').bind('near-reschedule',group,near,near+1800000,'online').run();
+ await assert.rejects(()=>move(alice,'near-reschedule'),/72 hours/);
+ await act(mentor,{action:'withdraw-slot',id:slots[5].id});
+ await assert.rejects(()=>move(alice,slots[5].id),/available slot/);
+ await move(alice,slots[2].id,{format:'in-person',location:'Library room 2'});
+ const changed=(await state(alice)).meetings;
+ assert.equal(changed.find(m=>m.id===old.id).status,'cancelled');
+ const current=changed.find(m=>m.status==='confirmed');
+ assert.equal(current.slot_id,slots[2].id);assert.equal(current.agenda,old.agenda);
+ assert.equal(current.location,'Library room 2');assert.equal(current.link,'');
+ assert.equal((await state(alice)).slots.find(s=>s.id===slots[0].id).taken,0);
+ assert.equal((await state(bob)).meetings.length,1,'other mentees cannot see rescheduling details');
+ await assert.rejects(()=>move(alice,slots[3].id),/cannot be rescheduled/);
+ const races=await Promise.allSettled([slots[3],slots[4]].map(s=>act(mentor,{action:'reschedule',id:current.id,slotId:s.id,format:'online'})));
+ assert.equal(races.filter(r=>r.status==='fulfilled').length,1,'only one replacement per original');
+ assert.equal((await state(alice)).meetings.filter(m=>m.status==='confirmed').length,1);
+});
+test('meeting links can be edited only by the group mentor and stay private',async()=>{
+ await setup();await act(mentor,{action:'publish-slots',day,from:'13:00',to:'14:00',duration:30,format:'online'});
+ const slot=(await state(alice)).slots[0];
+ await assert.rejects(()=>act(alice,{action:'book',slotId:slot.id,format:'in-person',location:'Library',agenda:'Test'}),/format/);
+ await act(alice,{action:'book',slotId:slot.id,format:'online',agenda:'Link test'});
+ const id=(await state(alice)).meetings[0].id;
+ await assert.rejects(()=>act(alice,{action:'meeting-link',id,link:'https://example.com'}),/Only your mentor/);
+ await assert.rejects(()=>act(other,{action:'meeting-link',id,link:'https://example.com'}),/not found/);
+ await assert.rejects(()=>act(mentor,{action:'meeting-link',id,link:'javascript:alert(1)'}),/https/);
+ for(const link of ['https://meet.google.com/first','https://meet.google.com/updated']) {
+  await act(mentor,{action:'meeting-link',id,link});assert.equal((await state(alice)).meetings[0].link,link);
+ }
+ assert.equal((await state(bob)).meetings.length,0);
+ await act(alice,{action:'cancel',id});
+ await assert.rejects(()=>act(mentor,{action:'meeting-link',id,link:'https://example.com'}),/not found/);
+});
 test('messages and announcement replies are private; announcements queue individual emails',async()=>{
  await setup();await act(mentor,{action:'announce',title:'Welcome',body:'Hello everyone'});const a=(await state(alice)).announcements[0];
  await act(alice,{action:'message',body:'Private reply',announcementId:a.id,menteeId:bob.userId});

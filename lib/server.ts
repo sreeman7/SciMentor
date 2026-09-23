@@ -122,6 +122,32 @@ export async function act(user: AuthUser, input: Record<string, unknown>) {
         await db.prepare("INSERT INTO meetings(id,group_id,slot_id,mentee_id,format,location,agenda,status,created_at) VALUES (?,?,?,?,?,?,?,'confirmed',?)").bind(crypto.randomUUID(), g, slot.id, m.user_id, format, location, field(input.agenda, 'Discussion topic', 2000), now).run();
         return { message: 'Meeting confirmed. You can find the details in My meetings.' };
     }
+    if (action === 'reschedule') {
+        const id = field(input.id, 'Meeting');
+        const slot = await one<{ id: string; start: number; format: string }>(
+            "SELECT id,start,format FROM slots WHERE id=? AND group_id=? AND status='published'", field(input.slotId, 'Slot'), g);
+        if (!slot || !canBook(slot.start))
+            throw new ApiError('Choose an available slot at least 72 hours from now.');
+        const format = field(input.format, 'Format', 20);
+        if (!['online', 'in-person'].includes(format) || (slot.format !== 'both' && slot.format !== format))
+            throw new ApiError('This meeting format is not offered for that slot.');
+        const location = format === 'in-person' ? field(input.location, 'In-person location', 250) : '';
+        // One statement: a failed replacement rolls back the cancellation as well.
+        // The existing booking guard validates the new slot under the group lock.
+        const result = await db.prepare(`WITH moved AS (
+            UPDATE meetings SET status='cancelled'
+            WHERE id=? AND group_id=? AND status='confirmed' AND slot_id<>?
+              AND EXISTS(SELECT 1 FROM slots WHERE slots.id=meetings.slot_id AND slots.start>?)
+              ${m.role === 'mentor' ? '' : 'AND mentee_id=?'}
+            RETURNING mentee_id,agenda
+        ) INSERT INTO meetings(id,group_id,slot_id,mentee_id,format,location,agenda,status,created_at)
+          SELECT ?,?,?,mentee_id,?,?,agenda,'confirmed',? FROM moved`)
+            .bind(id, g, slot.id, now, ...(m.role === 'mentor' ? [] : [m.user_id]),
+                crypto.randomUUID(), g, slot.id, format, location, now).run();
+        if (!result.meta.changes)
+            throw new ApiError('That meeting cannot be rescheduled. Refresh and choose a different available time.');
+        return { message: 'Meeting rescheduled. The previous time has been released.' };
+    }
     if (action === 'cancel') {
         const r = await db.prepare(`UPDATE meetings SET status='cancelled' WHERE id=? AND group_id=? AND status='confirmed' AND EXISTS(SELECT 1 FROM slots WHERE slots.id=meetings.slot_id AND slots.start>?) ${m.role === 'mentor' ? '' : 'AND mentee_id=?'}`).bind(...(m.role === 'mentor' ? [field(input.id, 'Meeting'), g, now] : [field(input.id, 'Meeting'), g, now, m.user_id])).run();
         if (!r.meta.changes)
