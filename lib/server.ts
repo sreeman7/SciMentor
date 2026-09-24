@@ -11,7 +11,7 @@ async function rows<T>(sql: string, ...args: unknown[]): Promise<T[]> { return (
 async function one<T>(sql: string, ...args: unknown[]): Promise<T | null> { return database().prepare(sql).bind(...args).first<T>(); }
 export async function identity() { const user = await getServerUser(); if (!user)
     throw new ApiError('Sign in to continue.', 401); return user; }
-async function membership(user: AuthUser) { return one<Member>('SELECT user_id,group_id,role,name,email FROM members WHERE user_id=?', user.userId); }
+async function membership(user: AuthUser) { return one<Member>('SELECT user_id,group_id,role,name,email,suspended_at FROM members WHERE user_id=?', user.userId); }
 function field(v: unknown, label: string, max = 2000) { if (typeof v !== 'string' || !v.trim() || v.trim().length > max)
     throw new ApiError(`${label} is required (maximum ${max} characters).`); return v.trim(); }
 function mentor(m: Member) { if (m.role !== 'mentor')
@@ -22,6 +22,7 @@ export async function state(user: AuthUser): Promise<PortalState> {
     const empty = { member: null, people: [], slots: [], meetings: [], announcements: [], messages: [], resources: [], invites: [], emailReady: !!(env.RESEND_API_KEY && env.EMAIL_FROM), emailPending: 0 };
     if (!member)
         return empty;
+    if (member.suspended_at != null) return { ...empty, member, emailReady: false };
     const g = member.group_id;
     const isMentor = member.role === 'mentor';
     const [group, people, slots, meetings, announcements, messages, resources, invites, pending] = await Promise.all([
@@ -29,23 +30,26 @@ export async function state(user: AuthUser): Promise<PortalState> {
             id: string;
             name: string;
         }>('SELECT id,name FROM groups WHERE id=?', g),
-        rows<Member>(isMentor ? 'SELECT user_id,group_id,role,name,email FROM members WHERE group_id=?' : 'SELECT user_id,group_id,role,name,email FROM members WHERE group_id=? AND (user_id=? OR role=\'mentor\')', ...(isMentor ? [g] : [g, member.user_id])),
+        rows<Member>(isMentor ? 'SELECT user_id,group_id,role,name,email,suspended_at FROM members WHERE group_id=?' : 'SELECT user_id,group_id,role,name,email,suspended_at FROM members WHERE group_id=? AND (user_id=? OR role=\'mentor\')', ...(isMentor ? [g] : [g, member.user_id])),
         rows<PortalState['slots'][number]>(`SELECT s.*,CAST(EXISTS(SELECT 1 FROM meetings m WHERE m.slot_id=s.id AND m.status='confirmed') AS integer) AS taken FROM slots s WHERE s.group_id=? AND s.status='published' AND s.end>? ORDER BY s.start`, g, Date.now()),
         rows<PortalState['meetings'][number]>(`SELECT m.*,s.start,s.end,u.name AS mentee_name FROM meetings m JOIN slots s ON s.id=m.slot_id JOIN members u ON u.user_id=m.mentee_id WHERE m.group_id=? ${isMentor ? '' : 'AND m.mentee_id=?'} ORDER BY s.start`, ...(isMentor ? [g] : [g, member.user_id])),
-        rows<PortalState['announcements'][number]>(`SELECT a.* ${isMentor ? ",(SELECT COUNT(*) FROM email_jobs e WHERE e.announcement_id=a.id AND e.status='sent') AS sent,(SELECT COUNT(*) FROM email_jobs e WHERE e.announcement_id=a.id AND e.status!='sent') AS pending" : ''} FROM announcements a WHERE a.group_id=? ORDER BY a.created_at DESC`, g),
+        rows<PortalState['announcements'][number]>(`SELECT a.* ${isMentor ? ",(SELECT COUNT(*) FROM email_jobs e WHERE e.announcement_id=a.id AND e.status='sent') AS sent,(SELECT COUNT(*) FROM email_jobs e WHERE e.announcement_id=a.id AND e.status NOT IN ('sent','cancelled')) AS pending" : ''} FROM announcements a WHERE a.group_id=? ORDER BY a.created_at DESC`, g),
         rows<PortalState['messages'][number]>(`SELECT m.*,a.title AS announcement_title FROM messages m LEFT JOIN announcements a ON a.id=m.announcement_id WHERE m.group_id=? ${isMentor ? '' : 'AND m.mentee_id=?'} ORDER BY m.created_at`, ...(isMentor ? [g] : [g, member.user_id])),
         rows<PortalState['resources'][number]>('SELECT * FROM resources WHERE group_id=? ORDER BY created_at DESC', g),
         isMentor ? rows<PortalState['invites'][number]>('SELECT hash,email,name,expires_at,revoked,used_by FROM invites WHERE group_id=? ORDER BY created_at DESC', g) : [],
         isMentor ? one<{
             n: number;
-        }>("SELECT COUNT(*) AS n FROM email_jobs WHERE group_id=? AND status!='sent'", g) : null,
+        }>("SELECT COUNT(*) AS n FROM email_jobs WHERE group_id=? AND status NOT IN ('sent','cancelled')", g) : null,
     ]);
+    const currentMember = await membership(user);
+    if (currentMember?.suspended_at != null) return { ...empty, member: currentMember, emailReady: false };
     return { ...empty, member, group: group ?? undefined, people, slots, meetings, announcements, messages, resources, invites, emailPending: pending?.n ?? 0 };
 }
 export async function act(user: AuthUser, input: Record<string, unknown>) {
     const db = database(), now = Date.now();
     const action = field(input.action, 'Action', 40);
     let m = await membership(user);
+    if (m?.suspended_at != null) throw new ApiError('Your access to this mentoring space is suspended. Contact your mentor.', 403);
     if (action === 'create-group') {
         if (m)
             throw new ApiError('You already belong to a mentoring space.');
@@ -68,11 +72,23 @@ export async function act(user: AuthUser, input: Record<string, unknown>) {
     if (!m)
         throw new ApiError('Create a space or join using your mentor’s invite code.', 403);
     const g = m.group_id;
+    if (action === 'suspend-member' || action === 'restore-member') {
+        mentor(m);
+        const id = field(input.id, 'Mentee');
+        const result = await db.prepare("UPDATE members SET suspended_at=? WHERE user_id=? AND group_id=? AND role='mentee'")
+            .bind(action === 'suspend-member' ? now : null, id, g).run();
+        if (!result.meta.changes) throw new ApiError('Mentee not found.', 404);
+        return { message: action === 'suspend-member'
+            ? 'Access suspended. Future meetings cancelled; message and meeting history preserved.'
+            : 'Access restored. Cancelled meetings stay cancelled; the mentee can book again.' };
+    }
     if (action === 'invite') {
         mentor(m);
         const email = field(input.email, 'Email', 254).toLowerCase(), name = field(input.name, 'Mentee name', 80);
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
             throw new ApiError('Enter a valid email address.');
+        if (await one('SELECT user_id FROM members WHERE group_id=? AND email=? AND suspended_at IS NOT NULL', g, email))
+            throw new ApiError('This mentee is suspended. Restore their access from Mentees instead.');
         const raw = Array.from(crypto.getRandomValues(new Uint8Array(16))).map(n => n.toString(16).padStart(2, '0')).join('').toUpperCase();
         const code = raw.match(/.{1,4}/g)!.join('-');
         await db.prepare('INSERT INTO invites(hash,group_id,email,name,expires_at,created_at) VALUES (?,?,?,?,?,?)').bind(await hash(code), g, email, name, now + 7 * 86400000, now).run();
@@ -168,9 +184,21 @@ export async function act(user: AuthUser, input: Record<string, unknown>) {
             throw new ApiError('Meeting not found.');
         return { message: 'Meeting link saved.' };
     }
+    if (action === 'read-messages') {
+        if (!Array.isArray(input.ids) || !input.ids.length || input.ids.length > 100 ||
+            input.ids.some(id => typeof id !== 'string' || !id || id.length > 100))
+            throw new ApiError('Choose between 1 and 100 messages to mark as read.');
+        // Acknowledge only the displayed IDs, never messages arriving after this request.
+        await db.prepare(`UPDATE messages SET read_at=?
+            WHERE group_id=? AND sender_id<>? AND read_at IS NULL
+              ${m.role === 'mentor' ? '' : 'AND mentee_id=?'}
+              AND id IN (${input.ids.map(() => '?').join(',')})`)
+            .bind(now, g, m.user_id, ...(m.role === 'mentor' ? [] : [m.user_id]), ...input.ids).run();
+        return { message: 'Messages marked as read.' };
+    }
     if (action === 'message') {
         const menteeId = m.role === 'mentee' ? m.user_id : field(input.menteeId, 'Mentee');
-        if (!await one("SELECT user_id FROM members WHERE user_id=? AND group_id=? AND role='mentee'", menteeId, g))
+        if (!await one("SELECT user_id FROM members WHERE user_id=? AND group_id=? AND role='mentee' AND suspended_at IS NULL", menteeId, g))
             throw new ApiError('Conversation not found.', 404);
         const announcementId = input.announcementId ? field(input.announcementId, 'Announcement') : null;
         if (announcementId && !await one('SELECT id FROM announcements WHERE id=? AND group_id=?', announcementId, g))
@@ -181,7 +209,7 @@ export async function act(user: AuthUser, input: Record<string, unknown>) {
     if (action === 'announce') {
         mentor(m);
         const id = crypto.randomUUID(), title = field(input.title, 'Title', 150), body = field(input.body, 'Announcement', 10000);
-        await db.batch([db.prepare('INSERT INTO announcements(id,group_id,title,body,created_at) VALUES (?,?,?,?,?)').bind(id, g, title, body, now), db.prepare("INSERT INTO email_jobs(id,group_id,announcement_id,recipient,subject,body,created_at) SELECT ?||':'||user_id,group_id,?,email,?,?,? FROM members WHERE group_id=? AND role='mentee'").bind(id, id, `[SciMentor] ${title}`, `${body}\n\n— ${m.name}\nPlease reply privately through your SciMentor portal.`, now, g)]);
+        await db.batch([db.prepare('INSERT INTO announcements(id,group_id,title,body,created_at) VALUES (?,?,?,?,?)').bind(id, g, title, body, now), db.prepare("INSERT INTO email_jobs(id,group_id,announcement_id,recipient,subject,body,created_at) SELECT ?||':'||user_id,group_id,?,email,?,?,? FROM members WHERE group_id=? AND role='mentee' AND suspended_at IS NULL").bind(id, id, `[SciMentor] ${title}`, `${body}\n\n— ${m.name}\nPlease reply privately through your SciMentor portal.`, now, g)]);
         const mail = await deliverEmails(g);
         return { message: mail.configured ? 'Announcement published. Email delivery status is shown on the announcement.' : 'Announcement published. Emails are queued until the email service is connected.' };
     }
@@ -227,14 +255,14 @@ export async function deliverEmails(groupId?: string) {
     if (!env.RESEND_API_KEY || !env.EMAIL_FROM)
         return { configured: false };
     const db = database(), now = Date.now();
-    const jobs = await rows<EmailJob>(`SELECT id,recipient,subject,body,first_attempt_at FROM email_jobs WHERE status IN ('pending','retry','sending') AND (lease_until IS NULL OR lease_until<?) ${groupId ? 'AND group_id=?' : ''} ORDER BY created_at LIMIT 20`, ...(groupId ? [now, groupId] : [now]));
+    const jobs = await rows<EmailJob>(`SELECT id,recipient,subject,body,first_attempt_at FROM email_jobs WHERE status IN ('pending','retry','sending') AND (lease_until IS NULL OR lease_until<?) AND EXISTS(SELECT 1 FROM members WHERE members.group_id=email_jobs.group_id AND members.email=email_jobs.recipient AND members.suspended_at IS NULL) ${groupId ? 'AND group_id=?' : ''} ORDER BY created_at LIMIT 20`, ...(groupId ? [now, groupId] : [now]));
     for (const job of jobs) {
         // Resend's idempotency window is finite: older uncertain sends need reconciliation.
         if (job.first_attempt_at && now - job.first_attempt_at > 23 * 3600000) {
             await db.prepare("UPDATE email_jobs SET status='review',error='Delivery needs manual reconciliation before retrying.' WHERE id=?").bind(job.id).run();
             continue;
         }
-        const claim = await db.prepare("UPDATE email_jobs SET status='sending',lease_until=?,attempts=attempts+1,first_attempt_at=COALESCE(first_attempt_at,?) WHERE id=? AND status IN ('pending','retry','sending') AND (lease_until IS NULL OR lease_until<?)").bind(now + 120000, now, job.id, now).run();
+        const claim = await db.prepare("UPDATE email_jobs SET status='sending',lease_until=?,attempts=attempts+1,first_attempt_at=COALESCE(first_attempt_at,?) WHERE id=? AND status IN ('pending','retry','sending') AND (lease_until IS NULL OR lease_until<?) AND EXISTS(SELECT 1 FROM members WHERE members.group_id=email_jobs.group_id AND members.email=email_jobs.recipient AND members.suspended_at IS NULL)").bind(now + 120000, now, job.id, now).run();
         if (!claim.meta.changes)
             continue;
         try {

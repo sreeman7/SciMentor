@@ -4,6 +4,7 @@ export type Member = {
     role: 'mentor' | 'mentee';
     name: string;
     email: string;
+    suspended_at: number | null;
 };
 export type Slot = {
     id: string;
@@ -40,6 +41,7 @@ export type Message = {
     sender_id: string;
     body: string;
     created_at: number;
+    read_at: number | null;
     announcement_id: string | null;
     announcement_title?: string;
 };

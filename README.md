@@ -8,6 +8,8 @@ A private science mentoring portal built with **Next.js, TypeScript, React, Tail
 - Online and in-person booking with a required in-person location and 72 hours’ notice.
 - Database-enforced booking conflicts and single-use, email-bound mentee invites.
 - Private mentor/mentee conversations, including private announcement replies.
+- Unread message counts with explicit “Mark conversation as read”, and mentor activity and missing-meeting-link panels. Refresh the portal to fetch new activity.
+- Mentors can suspend or restore mentee access. Suspension cancels future meetings, revokes unused invites for that email, and cancels unsent queued announcements while retaining history. Restoration does not reinstate cancelled meetings.
 - Group announcements, an email delivery queue, FAQs, and resources.
 
 ## Local setup
@@ -15,7 +17,7 @@ A private science mentoring portal built with **Next.js, TypeScript, React, Tail
 1. Install Node.js 22.13 or newer and run `npm ci`.
 2. Copy `.env.example` to `.env.local` and fill in your own values. Keep existing `.env` files private; `.env.local` takes precedence.
 3. Create a Supabase project. Copy its project URL and publishable key from Project Settings → API.
-4. In Supabase’s SQL editor, run `supabase/migrations/001_initial.sql` **once** against a new database. It creates the private `scimentor` schema, tables, indexes, and booking safeguards. Later changes must use new migrations.
+4. In Supabase’s SQL editor, run `supabase/migrations/001_initial.sql` **once** against a new database. It creates the private `scimentor` schema, tables, indexes, and booking safeguards. Then run `supabase/migrations/002_message_reads.sql` to add recipient read tracking. For existing databases, run only migration 002; do not rerun 001. Existing messages begin unread. Then run `supabase/migrations/003_member_access.sql` to enable suspension and restoration.
 5. Copy the **Transaction pooler** connection string from Supabase’s Connect dialog into `DATABASE_URL`. Use the actual host, username, and password shown there. Download the root CA certificate from **Database Settings → SSL Configuration**, base64-encode its contents, and set `DATABASE_SSL_CA_BASE64` in `.env.local`. Copy that value to Vercel’s environment variables when deploying. Hosted connections verify both the certificate and hostname using this CA; SSL options in the connection URL are replaced by the application’s verified TLS configuration.
 6. In Supabase Auth, enable email sign-in. Set the **Magic Link email template** to include the sign-in code: `<p>Your SciMentor code is: {{ .Token }}</p>`. The app verifies this code directly; it does not use a callback link. Existing email users sign in with the same flow; new users are created on their first verified sign-in.
 7. Configure Supabase’s Site URL for your deployment and configure production SMTP before inviting mentees. Supabase Auth sends login codes; Resend below sends announcements. These are separate email configurations.

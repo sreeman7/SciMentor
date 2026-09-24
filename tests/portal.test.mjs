@@ -4,12 +4,14 @@ import { PGlite } from '@electric-sql/pglite';
 import { createDatabase } from '../db/query.ts';
 import { readFileSync } from 'node:fs';
 import { build } from 'esbuild';
+import { dashboardSummary } from '../lib/dashboard.ts';
 import { canBook, NOTICE_MS, makeSlots, zonedTimestamp, dateKey, shiftDay } from '../lib/rules.ts';
 const sql=readFileSync(new URL('../supabase/migrations/001_initial.sql',import.meta.url),'utf8');
 let pg;
 async function testDatabase() {
  if(pg) await pg.close();
- pg=new PGlite();await pg.exec(sql);
+ pg=new PGlite();await pg.exec(sql);await pg.exec(readFileSync(new URL('../supabase/migrations/002_message_reads.sql',import.meta.url),'utf8'));
+ await pg.exec(readFileSync(new URL('../supabase/migrations/003_member_access.sql',import.meta.url),'utf8'));
  const query=client=>async(text,values)=>{const r=await client.query(text,values);return {rows:r.rows,rowCount:r.affectedRows??0};};
  return createDatabase(query(pg),fn=>pg.transaction(tx=>fn(query(tx))));
 }
@@ -113,6 +115,47 @@ test('messages and announcement replies are private; announcements queue individ
  const db=globalThis.__scimentorTestEnv.DB;const jobs=await db.prepare('SELECT * FROM email_jobs').all();assert.equal(jobs.results.length,2);assert.equal(jobs.results.every(j=>j.status==='pending'),true);
  assert.equal((await state(alice)).emailPending,0);assert.equal((await state(mentor)).emailPending,2);assert.equal((await state(other)).announcements.length,0);
 });
+test('unread messages can only be acknowledged by their recipient and known IDs',async()=>{
+ const db=await setup();
+ await act(alice,{action:'message',body:'First question'});
+ await act(bob,{action:'message',body:'Bob question'});
+ let mentorState=await state(mentor);
+ const first=mentorState.messages.find(m=>m.sender_id===alice.userId);
+ const bobMessage=mentorState.messages.find(m=>m.sender_id===bob.userId);
+ assert.equal(dashboardSummary(mentorState).unread.length,2);
+ assert.equal(dashboardSummary(await state(alice)).unread.length,0,'own messages are never unread');
+ await act(alice,{action:'read-messages',ids:[first.id,bobMessage.id]});
+ await act(other,{action:'read-messages',ids:[first.id,bobMessage.id]});
+ assert.equal(dashboardSummary(await state(mentor)).unread.length,2,'sender and another group cannot acknowledge');
+ await act(alice,{action:'message',body:'Arrived after the page loaded'});
+ await act(mentor,{action:'read-messages',ids:[first.id]});
+ mentorState=await state(mentor);
+ assert.equal(dashboardSummary(mentorState).unread.length,2,'new arrivals and other conversations stay unread');
+ const readAt=mentorState.messages.find(m=>m.id===first.id).read_at;
+ assert.ok(readAt);
+ await act(mentor,{action:'read-messages',ids:[first.id]});
+ assert.equal((await state(mentor)).messages.find(m=>m.id===first.id).read_at,readAt);
+ await act(mentor,{action:'message',menteeId:alice.userId,body:'Private answer'});
+ const aliceState=await state(alice),answer=aliceState.messages.find(m=>m.sender_id===mentor.userId);
+ assert.equal(dashboardSummary(aliceState).unread.length,1);
+ assert.equal(dashboardSummary(aliceState).mentees.length,0);
+ assert.equal((await state(bob)).messages.some(m=>m.id===answer.id),false);
+ await act(bob,{action:'read-messages',ids:[answer.id]});
+ assert.equal(dashboardSummary(await state(alice)).unread.length,1);
+ await act(alice,{action:'read-messages',ids:[answer.id]});
+ assert.equal(dashboardSummary(await state(alice)).unread.length,0);
+ await assert.rejects(()=>act(mentor,{action:'read-messages',ids:[]}),/between 1 and 100/);
+ await assert.rejects(()=>act(mentor,{action:'read-messages',ids:Array(101).fill(first.id)}),/between 1 and 100/);
+ // Add a meeting and verify the dashboard identifies the missing link.
+ await act(mentor,{action:'publish-slots',day,from:'13:00',to:'14:00',duration:30,format:'online'});
+ await act(alice,{action:'book',slotId:(await state(alice)).slots[0].id,format:'online',agenda:'Dashboard'});
+ let summary=dashboardSummary(await state(mentor));
+ assert.equal(summary.missingLinks.length,1);
+ assert.equal(summary.mentees.find(m=>m.person.user_id===alice.userId).nextMeeting.agenda,'Dashboard');
+ assert.equal(summary.mentees.find(m=>m.person.user_id===alice.userId).lastMessage.body,'Arrived after the page loaded');
+ await act(mentor,{action:'meeting-link',id:summary.missingLinks[0].id,link:'https://meet.google.com/ready'});
+ assert.equal(dashboardSummary(await state(mentor)).missingLinks.length,0);
+});
 test('invite codes are email-bound, revocable, single-use, and never grant mentor access',async()=>{
  await setup();const invite=await act(mentor,{action:'invite',name:'Outside',email:outsider.email});
  await assert.rejects(()=>act(user('wrong'),{action:'join',name:'Wrong',code:invite.code}),/invalid/);
@@ -120,6 +163,55 @@ test('invite codes are email-bound, revocable, single-use, and never grant mento
  await assert.rejects(()=>act({...outsider,userId:'replay'},{action:'join',name:'Again',code:invite.code}),/invalid/);
  const second=await act(mentor,{action:'invite',name:'Revoked',email:'revoked@example.test'});const pending=(await state(mentor)).invites.find(i=>i.email==='revoked@example.test');
  await act(mentor,{action:'revoke-invite',hash:pending.hash});await assert.rejects(()=>act(user('revoked'),{action:'join',name:'Revoked',code:second.code}),/invalid/);
+});
+test('mentors suspend and restore only their mentees while retaining history',async()=>{
+ const db=await setup();
+ await act(mentor,{action:'publish-slots',day,from:'13:00',to:'15:00',duration:30,format:'online'});
+ const before=await state(alice),slots=before.slots,group=before.member.group_id;
+ await act(alice,{action:'book',slotId:slots[0].id,format:'online',agenda:'Alice future'});
+ await act(bob,{action:'book',slotId:slots[1].id,format:'online',agenda:'Bob future'});
+ await act(alice,{action:'message',body:'Preserved question'});
+ await act(mentor,{action:'announce',title:'Before suspension',body:'Queued emails'});
+ const invite=await act(mentor,{action:'invite',email:alice.email,name:'Duplicate invite'});
+ const original=(await state(alice)).meetings[0];
+ for(const who of [alice,bob]) await assert.rejects(()=>act(who,{action:'suspend-member',id:alice.userId}),/Only your mentor/);
+ await assert.rejects(()=>act(other,{action:'suspend-member',id:alice.userId}),/not found/);
+ await assert.rejects(()=>act(mentor,{action:'suspend-member',id:mentor.userId}),/not found/);
+ await act(mentor,{action:'suspend-member',id:alice.userId});
+ const blocked=await state(alice);
+ assert.ok(blocked.member.suspended_at);assert.equal(blocked.group,undefined);
+ for(const key of ['people','slots','meetings','messages','announcements','resources','invites']) assert.deepEqual(blocked[key],[]);
+ for(const input of [
+  {action:'message',body:'Blocked'}, {action:'book',slotId:slots[2].id,format:'online',agenda:'Blocked'},
+  {action:'cancel',id:original.id}, {action:'reschedule',id:original.id,slotId:slots[2].id,format:'online'},
+  {action:'read-messages',ids:['unknown']}, {action:'restore-member',id:alice.userId},
+  {action:'join',code:invite.code,name:'Bypass'}, {action:'create-group',name:'Bypass',title:'Bypass'}
+ ]) await assert.rejects(()=>act(alice,input),/suspended/);
+ let mentorState=await state(mentor);
+ assert.equal(mentorState.meetings.find(m=>m.id===original.id).status,'cancelled');
+ assert.equal(mentorState.messages.some(m=>m.body==='Preserved question'),true);
+ assert.equal((await state(bob)).meetings[0].status,'confirmed');
+ assert.equal((await state(bob)).slots.find(s=>s.id===slots[0].id).taken,0);
+ assert.equal(mentorState.invites.find(i=>i.email===alice.email && !i.used_by).revoked,1);
+ const jobs=(await db.prepare('SELECT recipient,status FROM email_jobs').all()).results;
+ assert.equal(jobs.find(j=>j.recipient===alice.email).status,'cancelled');
+ assert.equal(jobs.find(j=>j.recipient===bob.email).status,'pending');
+ await act(mentor,{action:'announce',title:'During suspension',body:'Active mentees only'});
+ assert.equal((await db.prepare('SELECT * FROM email_jobs WHERE recipient=?').bind(alice.email).all()).results.length,1);
+ await assert.rejects(()=>act(mentor,{action:'invite',email:alice.email,name:'Bypass'}),/Restore their access/);
+ await assert.rejects(()=>act(mentor,{action:'message',menteeId:alice.userId,body:'Blocked'}),/not found/);
+ // Database guards also reject writes that raced with suspension after API authorization.
+ await assert.rejects(()=>db.prepare("INSERT INTO meetings(id,group_id,slot_id,mentee_id,format,agenda,created_at) VALUES ('raced-booking',?,?,?,'online','Race',?)").bind(group,slots[2].id,alice.userId,Date.now()).run(),/member_suspended/);
+ await assert.rejects(()=>db.prepare("INSERT INTO messages(id,group_id,mentee_id,sender_id,body,created_at) VALUES ('raced-message',?,?,?,'Race',?)").bind(group,alice.userId,alice.userId,Date.now()).run(),/member_suspended/);
+ await assert.rejects(()=>act(other,{action:'restore-member',id:alice.userId}),/not found/);
+ await act(mentor,{action:'restore-member',id:alice.userId});
+ const restored=await state(alice);
+ assert.equal(restored.member.suspended_at,null);
+ assert.equal(restored.messages[0].body,'Preserved question');
+ assert.equal(restored.meetings[0].status,'cancelled','restoration never resurrects cancelled meetings');
+ await act(alice,{action:'book',slotId:slots[0].id,format:'online',agenda:'New booking'});
+ await act(alice,{action:'message',body:'Back again'});
+ assert.equal((await state(alice)).meetings.filter(m=>m.status==='confirmed').length,1);
 });
 test('resources require mentor ownership and safe URLs',async()=>{
  await setup();await act(mentor,{action:'resource',kind:'faq',title:'Where do we meet?',body:'Choose an available slot and enter a location.',category:'Meetings'});
