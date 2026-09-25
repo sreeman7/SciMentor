@@ -1,6 +1,7 @@
 import { authClient, authConfigured } from '@/lib/auth';
+import { isSameOrigin } from '@/lib/request-origin';
 export async function POST(request: Request) {
-  if (request.headers.get('origin') !== new URL(request.url).origin) return new Response('Forbidden', { status: 403 });
+  if (!isSameOrigin(request)) return new Response('Forbidden', { status: 403 });
   if (authConfigured()) {
     const { error } = await (await authClient()).auth.signOut({ scope: 'local' });
     if (error) return new Response('Sign-out failed. Please try again.', { status: 503 });

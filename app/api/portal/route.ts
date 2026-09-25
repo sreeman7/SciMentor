@@ -1,4 +1,5 @@
 import { act, ApiError, identity, state } from '@/lib/server';
+import { isSameOrigin } from '@/lib/request-origin';
 export const dynamic = 'force-dynamic';
 const headers = { 'Cache-Control': 'private, no-store', 'Vary': 'Cookie' };
 function failure(error: unknown) {
@@ -21,8 +22,7 @@ catch (e) {
 } }
 export async function POST(request: Request) {
     try {
-        const origin = request.headers.get('origin');
-        if (!origin || origin !== new URL(request.url).origin)
+        if (!isSameOrigin(request))
             throw new ApiError('This request must come from your SciMentor portal.', 403);
         if (!request.headers.get('content-type')?.includes('application/json'))
             throw new ApiError('Expected a JSON request.');

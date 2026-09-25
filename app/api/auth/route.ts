@@ -1,8 +1,9 @@
 import { authClient, authConfigured } from '@/lib/auth';
+import { isSameOrigin } from '@/lib/request-origin';
 export const runtime = 'nodejs';
 export async function POST(request: Request) {
   const headers = { 'Cache-Control': 'private, no-store' };
-  if (request.headers.get('origin') !== new URL(request.url).origin) return Response.json({ error: 'Use the sign-in form on SciMentor.' }, { status: 403, headers });
+  if (!isSameOrigin(request)) return Response.json({ error: 'Use the sign-in form on SciMentor.' }, { status: 403, headers });
   if (!authConfigured()) return Response.json({ error: 'Email sign-in is not connected yet.' }, { status: 503, headers });
   try {
     const raw = await request.text();
