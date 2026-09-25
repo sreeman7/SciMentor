@@ -1,63 +1,180 @@
 # SciMentor
 
-A private science mentoring portal built with **Next.js, TypeScript, React, Tailwind CSS, Supabase Auth, and PostgreSQL**. Deploy to Vercel or any host that runs a standard Next.js Node server.
+A private mentoring portal for science mentors and mentees. Mentors publish weekly availability, manage meetings, share resources, and answer questions privately.
+
+**Live website:** [sci-mentor.vercel.app](https://sci-mentor.vercel.app/)
+
+SciMentor is an independent student project, not an official University of Alberta service.
 
 ## Features
 
-- Availability published separately for each week, in Edmonton time.
-- Online and in-person booking with a required in-person location and 72 hours’ notice.
-- Database-enforced booking conflicts and single-use, email-bound mentee invites.
-- Private mentor/mentee conversations, including private announcement replies.
-- Unread message counts with explicit “Mark conversation as read”, and mentor activity and missing-meeting-link panels. Refresh the portal to fetch new activity.
-- Mentors can suspend or restore mentee access. Suspension cancels future meetings, revokes unused invites for that email, and cancels unsent queued announcements while retaining history. Restoration does not reinstate cancelled meetings.
-- Group announcements, an email delivery queue, FAQs, and resources.
+- Separate mentoring spaces, with email-bound, single-use invitations that expire after seven days.
+- Date-specific availability in Edmonton time, with a minimum booking notice of 72 hours.
+- Online and in-person meetings; in-person bookings require a location.
+- Rescheduling that keeps the original booking if the replacement fails.
+- Mentor-managed meeting links and explicit meeting cancellation.
+- Private conversations and private replies to group announcements.
+- Unread message counts, mentee activity, and reminders for missing meeting links.
+- Suspension and restoration of mentee access, with history preserved.
+- Searchable FAQs and resources, plus optional announcement email delivery.
 
-## Local setup
+## Technology
 
-1. Install Node.js 22.13 or newer and run `npm ci`.
-2. Copy `.env.example` to `.env.local` and fill in your own values. Keep existing `.env` files private; `.env.local` takes precedence.
-3. Create a Supabase project. Copy its project URL and publishable key from Project Settings → API.
-4. In Supabase’s SQL editor, run `supabase/migrations/001_initial.sql` **once** against a new database. It creates the private `scimentor` schema, tables, indexes, and booking safeguards. Then run `supabase/migrations/002_message_reads.sql` to add recipient read tracking. For existing databases, run only migration 002; do not rerun 001. Existing messages begin unread. Then run `supabase/migrations/003_member_access.sql` to enable suspension and restoration.
-5. Copy the **Transaction pooler** connection string from Supabase’s Connect dialog into `DATABASE_URL`. Use the actual host, username, and password shown there. Download the root CA certificate from **Database Settings → SSL Configuration**, base64-encode its contents, and set `DATABASE_SSL_CA_BASE64` in `.env.local`. Copy that value to Vercel’s environment variables when deploying. Hosted connections verify both the certificate and hostname using this CA; SSL options in the connection URL are replaced by the application’s verified TLS configuration.
-6. In Supabase Auth, enable email sign-in. Set the **Magic Link email template** to include the sign-in code: `<p>Your SciMentor code is: {{ .Token }}</p>`. The app verifies this code directly; it does not use a callback link. Existing email users sign in with the same flow; new users are created on their first verified sign-in.
-7. Configure Supabase’s Site URL for your deployment and configure production SMTP before inviting mentees. Supabase Auth sends login codes; Resend below sends announcements. These are separate email configurations.
-8. Run `npm run dev` and open `http://127.0.0.1:5173`.
+| Area | Tools |
+| --- | --- |
+| Frontend | React, TypeScript, Tailwind CSS, shadcn/ui |
+| Backend | Next.js route handlers and server-side TypeScript |
+| Database | Supabase PostgreSQL through `pg` |
+| Authentication | Supabase email verification codes |
+| Hosting | Vercel, or a host supporting Next.js |
+| Tests | Node.js test runner and PGlite PostgreSQL |
 
-Without Supabase configuration, the welcome page still renders and the login page explains that sign-in is not connected. There is no simulated user or authentication bypass. Once connected, sign in, create your mentor space, and generate invite codes for your mentees’ email addresses.
+## Repository structure
 
-Each account belongs to one mentoring space in this first version. Fellow mentors can create their own spaces. Mentees join with an invite code after verifying their email.
+The frontend and backend are organized separately inside one Next.js application. They share one package file and deploy together. Run commands from the directory containing `package.json`.
 
-## Vercel deployment
+```text
+.
+├── app/                        # Next.js routing and server-rendered page entry points
+│   ├── api/                    # Thin exports for backend HTTP handlers
+│   ├── auth/signout/           # Sign-out route
+│   ├── login/                  # Login page entry point
+│   ├── layout.tsx              # Metadata and global layout
+│   └── page.tsx                # Selects welcome page or authenticated portal
+├── frontend/
+│   ├── pages/                  # Portal, welcome page, and sign-in form
+│   ├── components/             # Dashboard components and reusable UI
+│   ├── hooks/                  # Browser/UI hooks
+│   ├── lib/                    # Dashboard calculations and styling utilities
+│   └── styles/                 # Global styles and Tailwind setup
+├── backend/
+│   ├── handlers/               # Auth, portal, sign-out, and email-job HTTP handlers
+│   ├── services/               # Portal business rules and announcement delivery
+│   ├── db/                     # PostgreSQL connection, TLS, and query adapter
+│   ├── auth.ts                # Verified Supabase identity and cookie handling
+│   └── request-origin.ts      # Same-origin request checks
+├── shared/                     # Types and rules used by both layers
+├── supabase/migrations/        # Ordered PostgreSQL schema migrations
+├── tests/                      # Service, privacy, booking, and origin-check tests
+├── public/                     # Public static assets
+├── vendor/                     # Third-party styles and their license
+├── proxy.ts                    # Supabase session refresh
+└── .env.example                # Configuration names without credentials
+```
 
-1. Push your changes to GitHub yourself.
-2. In Vercel, import the repository and select the **Next.js** framework preset.
-3. Use the directory containing `package.json` as the Root Directory. This repository currently starts inside `portal`, so leave Vercel’s Root Directory at its default if `package.json` is at the GitHub repository root.
-4. Add the values from `.env.example` in Vercel’s Environment Variables. `DATABASE_URL`, `RESEND_API_KEY`, and `EMAIL_JOB_SECRET` must remain server-only. Never add a `NEXT_PUBLIC_` prefix to secrets.
-5. Deploy. Use Vercel’s supplied HTTPS URL as the Supabase Site URL.
-6. Test sign-in with two accounts, mentor onboarding, invite redemption, bookings, and private replies before inviting the group.
+**Where to edit:** change screens in `frontend/pages`, reusable controls in `frontend/components`, permissions and booking behavior in `backend/services/portal.ts`, and API responses in `backend/handlers`. Keep database credentials and server integrations in the backend. `shared/` contains only code safe to import in either layer. The `app/` directory connects these layers to Next.js URLs.
 
-Standard scripts are `npm run build` and `npm start`. Development and builds use Next.js’s supported webpack compiler to avoid a local Turbopack worker issue. Other Node hosts can run those same commands with the same environment variables. No special Vercel configuration file is required.
+## Run locally
 
-## Announcement email
+1. Install Node.js 22.13 or newer.
+2. Install dependencies:
 
-Set `RESEND_API_KEY` and `EMAIL_FROM` (a verified sender). Publishing saves an announcement and a separate email job per joined mentee atomically. If email is not configured, the UI reports queued delivery. Invite codes are displayed for you to share; creating an invite does not email anyone.
+   ```bash
+   npm ci
+   ```
 
-The server attempts announcement delivery immediately and offers a manual retry. For unattended processing, an external scheduler can POST `/api/email-jobs` with `Authorization: Bearer <EMAIL_JOB_SECRET>`. A scheduler has not been provisioned. Leases and provider idempotency keys guard against duplicate sends; uncertain deliveries older than 23 hours require review. “Sent” means accepted by the provider, not confirmed inbox delivery.
+3. For a new checkout, copy `.env.example` to `.env.local` and fill in the required values below. Keep an existing `.env.local`; do not overwrite working credentials.
+4. Prepare Supabase using the next section.
+5. Start the application:
 
-## Privacy and database design
+   ```bash
+   npm run dev
+   ```
 
-All application tables live in the **private `scimentor` schema**, with no public grants and row-level security enabled. Browser clients cannot query these tables directly. The server uses `DATABASE_URL`; every API operation checks the verified Supabase user, their membership, their role, and the relevant conversation or booking participants. Do not grant browser roles access to this schema.
+6. Open [localhost on port 5173](http://127.0.0.1:5173).
 
-Availability changes and booking inserts lock the mentor group row within their transactions; database triggers check overlaps and the 72-hour rule. A unique partial index permits only one confirmed booking per slot. Existing booked availability cannot be withdrawn silently. Mentors and the booked mentee can reschedule a future meeting to another published slot with 72 hours’ notice. Cancellation and the replacement booking succeed together in one SQL statement; if the new slot is unavailable, the original stays confirmed. The old booking stays in the meeting list as cancelled, the discussion topic carries over, and online links must be added for the new time. Mentors can add or edit online links; only the meeting participants can see them.
+Both frontend and backend run through this one command. Development and builds use the Next.js webpack compiler.
 
-## Verification
+## Environment variables
 
-```sh
+Store local values in `.env.local`. Add production values in Vercel's project settings. `.env.local` is ignored by Git.
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `NEXT_PUBLIC_SUPABASE_URL` | Yes | Supabase project URL |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Yes | Supabase browser-safe publishable key |
+| `DATABASE_URL` | Yes | Server-only transaction-pooler connection string |
+| `DATABASE_SSL_CA_BASE64` | For this Supabase setup | Base64-encoded root CA certificate for verified TLS |
+| `RESEND_API_KEY` | No | Sends announcement emails through Resend |
+| `EMAIL_FROM` | With Resend | Sender verified in Resend |
+| `EMAIL_JOB_SECRET` | With an external scheduler | Protects the announcement email-job endpoint |
+
+The `NEXT_PUBLIC_` values are intentionally available to the browser. Never give database passwords or email credentials that prefix. Hosted database connections verify certificates and hostnames; download the root CA from Supabase's Database Settings → SSL Configuration and base64-encode its contents for `DATABASE_SSL_CA_BASE64`.
+
+## Supabase setup
+
+### Database
+
+For a new database, run these files in the Supabase SQL editor, in order:
+
+1. `supabase/migrations/001_initial.sql` — private schema, tables, and booking safeguards.
+2. `supabase/migrations/002_message_reads.sql` — message read tracking.
+3. `supabase/migrations/003_member_access.sql` — suspension, restoration, and related database safeguards.
+
+For an existing database, run only migrations that have not been applied. Do not rerun migration 001. Moving the code into frontend and backend folders requires no database migration.
+
+Copy the **Transaction pooler** connection string from Supabase's **Connect** dialog into `DATABASE_URL`. Use the same Supabase project for the URL, publishable key, and database connection.
+
+### Sign-in emails
+
+1. Enable the Email provider under **Authentication → Sign In / Providers**.
+2. Configure your sending provider under **Authentication → Emails → SMTP Settings**. SMTP credentials belong in Supabase, not in the website's frontend or GitHub.
+3. In both **Confirm sign up** and **Magic link or OTP** email templates, include the verification code:
+
+   ```html
+   <h2>Your SciMentor sign-in code</h2>
+   <p>Enter this code on the website:</p>
+   <h1>{{ .Token }}</h1>
+   <p>If you did not request this, ignore this email.</p>
+   ```
+
+4. Set **Authentication → URL Configuration → Site URL** to the website address. For local development, use `http://127.0.0.1:5173`; for production, use the deployed HTTPS URL.
+
+The app verifies the code directly. New users and existing users use the same sign-in form. Each account belongs to one mentoring space: mentors create a space, and mentees join with an invite tied to their verified email.
+
+## Deploy to Vercel
+
+1. Commit and push the desired changes to GitHub.
+2. Import the GitHub repository into Vercel.
+3. Choose **Next.js**. Keep the Root Directory at `./` when `package.json` is at the repository root; do not set it to `frontend` or `backend`.
+4. Use `npm run build` as the build command and leave the output directory at the framework default.
+5. Add the four Supabase/database variables above to the **Production** environment.
+6. Deploy. After changing environment variables, redeploy for the changes to take effect.
+7. Set the deployed HTTPS URL as the Supabase Auth Site URL.
+8. Test the live sign-in and mentoring flows before inviting real mentees.
+
+The Vercel–Supabase marketplace integration is optional. The app can use the existing Supabase project directly through its environment variables.
+
+## Privacy and access
+
+Application tables live in the private `scimentor` schema, with row-level security enabled and no public grants. Browsers access authorized server routes; they do not query these tables directly. The backend checks the verified identity, membership, role, and conversation or meeting participants.
+
+Mentees can see their own meetings and private conversations. Group announcements are shared, but replies are private. Mentors see the members and activity in their own space.
+
+Suspending a mentee blocks access, cancels future meetings, revokes unused invites for that email, and cancels queued announcements that have not entered delivery. Existing messages and meeting history are retained. Email already handed to a provider cannot be recalled. Restoring access does not reinstate cancelled meetings.
+
+Database safeguards prevent double bookings and enforce notice requirements. Rescheduling cancels the old meeting and inserts the replacement in one atomic statement. The discussion topic carries over; a new online meeting link must be added for the new time.
+
+## Optional announcement emails
+
+Supabase SMTP sends **sign-in codes**. Resend sends **mentor announcements**. These are separate configurations.
+
+With `RESEND_API_KEY` and a verified `EMAIL_FROM`, publishing an announcement attempts delivery to active mentees. Without them, the announcement still appears in the portal and email copies remain queued. Publishing and retrying later can send queued announcements.
+
+For scheduled retries, configure an external scheduler to POST to `/api/email-jobs` with `Authorization: Bearer <EMAIL_JOB_SECRET>`. A scheduler is not included. Delivery jobs use leases and idempotency keys; uncertain deliveries older than the retry window require review. A sent status means the provider accepted the email, not that it reached the inbox.
+
+## Checks and testing
+
+```bash
 npm run typecheck
 npm test
 npm run build
 ```
 
-Tests run the actual SQL migration and application service against an isolated embedded PostgreSQL engine (PGlite). They cover timezone/DST rules, conflicts, transaction rollback, privacy, invite restrictions, announcement queueing, safe links, and private-schema permissions. They do not use your Supabase project or send real email. Production database connectivity and real email delivery need to be checked after you add your credentials.
+Tests run the actual service code and migrations against an isolated PGlite database. They cover booking conflicts, rescheduling rollback, privacy, invitations, unread messages, suspension/restoration, safe links, and request-origin validation. They do not use the live Supabase database or send email.
 
-The previous local preview data was backed up outside this repository before the database conversion; it is not automatically migrated into Supabase. The new database starts empty. Secrets, dependencies, build output, and local databases are ignored by Git.
+Before sharing the portal, test mentor sign-in, two separate mentee accounts, invitations, online and in-person bookings, rescheduling, private messages, and suspension/restoration on the deployed site. Confirm that neither mentee can see the other's private data.
+
+## License
+
+See [LICENSE](LICENSE). Third-party style licensing is preserved under `vendor/`.

@@ -1,17 +1,17 @@
 "use client";
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
-import { CalendarDays, GraduationCap, LayoutDashboard, MessageSquare, Megaphone, BookOpen, Users, ArrowUpRight, Clock3, ShieldCheck, Plus, ChevronLeft, ChevronRight, Video, MapPin, LockKeyhole, ArrowRight, LogOut, Copy, ExternalLink, Mail, Check, Trash2, LoaderCircle } from 'lucide-react';
-import { Sidebar, SidebarProvider, SidebarContent, SidebarHeader, SidebarFooter, SidebarTrigger, useSidebar } from '@/components/ui/sidebar';
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
-import { AlertDialog, AlertDialogContent, AlertDialogHeader, AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogCancel, AlertDialogAction } from '@/components/ui/alert-dialog';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
-import { Toaster } from '@/components/ui/sonner';
+import { CalendarDays, GraduationCap, LayoutDashboard, MessageSquare, Megaphone, BookOpen, Users, ArrowUpRight, Clock3, ShieldCheck, Plus, ChevronLeft, ChevronRight, Video, MapPin, LockKeyhole, ArrowRight, LogOut, Copy, ExternalLink, Mail, Check, LoaderCircle } from 'lucide-react';
+import { Sidebar, SidebarProvider, SidebarContent, SidebarHeader, SidebarFooter, SidebarTrigger, useSidebar } from '@/frontend/components/ui/sidebar';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/frontend/components/ui/dialog';
+import { AlertDialog, AlertDialogContent, AlertDialogHeader, AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogCancel, AlertDialogAction } from '@/frontend/components/ui/alert-dialog';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/frontend/components/ui/select';
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/frontend/components/ui/tabs';
+import { Toaster } from '@/frontend/components/ui/sonner';
 import { toast } from 'sonner';
-import { DashboardInsights } from '@/components/dashboard-insights';
-import { dashboardSummary } from '@/lib/dashboard';
-import type { PortalState, Slot, Meeting } from '@/lib/types';
-import { dateKey, monday, shiftDay, clockTime, fullDate, canBook, TIMEZONE } from '@/lib/rules';
+import { DashboardInsights } from '@/frontend/components/dashboard-insights';
+import { dashboardSummary } from '@/frontend/lib/dashboard';
+import type { PortalState, Slot, Meeting } from '@/shared/types';
+import { dateKey, monday, shiftDay, clockTime, fullDate, canBook, TIMEZONE } from '@/shared/rules';
 type View = 'overview' | 'availability' | 'meetings' | 'messages' | 'announcements' | 'resources' | 'mentees';
 type Modal = {
     type: 'availability' | 'book' | 'announce' | 'invite' | 'resource' | 'link' | 'reschedule';
@@ -103,7 +103,7 @@ export default function Portal({ user }: {
     const mentor = data?.member?.role === 'mentor';
     const mentees = data?.people.filter(p => p.role === 'mentee') ?? [];
     const suspended = data?.member?.suspended_at != null;
-    const now = Date.now();
+    const [now, setNow] = useState(() => Date.now());
     const summary = data ? dashboardSummary(data, now) : null;
     const upcoming = summary?.upcoming ?? [];
     const unread = summary?.unread ?? [];
@@ -126,8 +126,13 @@ export default function Portal({ user }: {
     finally {
         setLoading(false);
     } }
-    useEffect(() => { void load(); const sync = () => { const v = location.hash.slice(1) as View; if (v in titles)
-        setView(v); }; sync(); window.addEventListener('hashchange', sync); return () => window.removeEventListener('hashchange', sync); }, []);
+    useEffect(() => {
+        const sync = () => { const v = location.hash.slice(1) as View; if (v in titles) setView(v); };
+        const initialLoad = window.setTimeout(() => { void load(); sync(); }, 0);
+        const clock = window.setInterval(() => setNow(Date.now()), 30000);
+        window.addEventListener('hashchange', sync);
+        return () => { window.clearTimeout(initialLoad); window.clearInterval(clock); window.removeEventListener('hashchange', sync); };
+    }, []);
     function go(v: View) { setView(v); location.hash = v; setError(''); }
     async function run(input: Record<string, unknown>) { if (lock.current)
         return null; lock.current = true; setBusy(true); setError(''); try {

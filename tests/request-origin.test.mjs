@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isSameOrigin } from '../lib/request-origin.ts';
+import { isSameOrigin } from '../backend/request-origin.ts';
 
 test('origin validation uses the public host and preserves cross-site protection', () => {
     const request = (origin, host='127.0.0.1:5173') => new Request('http://localhost:5173/api/auth', {

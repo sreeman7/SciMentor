@@ -1,4 +1,4 @@
-import type { PortalState } from './types';
+import type { PortalState } from '../../shared/types';
 
 export function dashboardSummary(data: PortalState, now = Date.now()) {
     const unread = data.messages.filter(message => message.sender_id !== data.member?.user_id && message.read_at == null);

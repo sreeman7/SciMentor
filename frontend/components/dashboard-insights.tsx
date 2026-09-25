@@ -1,7 +1,7 @@
 import { MessageSquare, Video } from 'lucide-react';
-import type { Meeting, PortalState } from '@/lib/types';
-import { dashboardSummary } from '@/lib/dashboard';
-import { clockTime, fullDate } from '@/lib/rules';
+import type { Meeting, PortalState } from '@/shared/types';
+import { dashboardSummary } from '@/frontend/lib/dashboard';
+import { clockTime, fullDate } from '@/shared/rules';
 
 export function DashboardInsights({ data, onConversation, onMeetingLink }: {
     data: PortalState;

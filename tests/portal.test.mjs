@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PGlite } from '@electric-sql/pglite';
-import { createDatabase } from '../db/query.ts';
+import { createDatabase } from '../backend/db/query.ts';
 import { readFileSync } from 'node:fs';
 import { build } from 'esbuild';
-import { dashboardSummary } from '../lib/dashboard.ts';
-import { canBook, NOTICE_MS, makeSlots, zonedTimestamp, dateKey, shiftDay } from '../lib/rules.ts';
+import { dashboardSummary } from '../frontend/lib/dashboard.ts';
+import { canBook, NOTICE_MS, makeSlots, zonedTimestamp, dateKey, shiftDay } from '../shared/rules.ts';
 const sql=readFileSync(new URL('../supabase/migrations/001_initial.sql',import.meta.url),'utf8');
 let pg;
 async function testDatabase() {
@@ -15,7 +15,7 @@ async function testDatabase() {
  const query=client=>async(text,values)=>{const r=await client.query(text,values);return {rows:r.rows,rowCount:r.affectedRows??0};};
  return createDatabase(query(pg),fn=>pg.transaction(tx=>fn(query(tx))));
 }
-const bundled=await build({entryPoints:['lib/server.ts'],bundle:true,write:false,format:'esm',platform:'node',plugins:[{name:'test-bindings',setup(b){b.onResolve({filter:/^(@\/db|@\/lib\/auth)$/},a=>({path:a.path,namespace:'mock'}));b.onLoad({filter:/.*/,namespace:'mock'},a=>({contents:a.path==='@/db'?'export function getDatabase(){return globalThis.__scimentorTestEnv.DB}':'export async function getServerUser(){return globalThis.__scimentorTestUser??null}'}));}}]});
+const bundled=await build({entryPoints:['backend/services/portal.ts'],bundle:true,write:false,format:'esm',platform:'node',plugins:[{name:'test-bindings',setup(b){b.onResolve({filter:/^(@\/backend\/db|@\/backend\/auth)$/},a=>({path:a.path,namespace:'mock'}));b.onLoad({filter:/.*/,namespace:'mock'},a=>({contents:a.path==='@/backend/db'?'export function getDatabase(){return globalThis.__scimentorTestEnv.DB}':'export async function getServerUser(){return globalThis.__scimentorTestUser??null}'}));}}]});
 globalThis.__scimentorTestEnv={};
 delete process.env.RESEND_API_KEY;delete process.env.EMAIL_FROM;
 const {act,state,identity}=await import('data:text/javascript;base64,'+Buffer.from(bundled.outputFiles[0].text).toString('base64'));
@@ -116,7 +116,7 @@ test('messages and announcement replies are private; announcements queue individ
  assert.equal((await state(alice)).emailPending,0);assert.equal((await state(mentor)).emailPending,2);assert.equal((await state(other)).announcements.length,0);
 });
 test('unread messages can only be acknowledged by their recipient and known IDs',async()=>{
- const db=await setup();
+ await setup();
  await act(alice,{action:'message',body:'First question'});
  await act(bob,{action:'message',body:'Bob question'});
  let mentorState=await state(mentor);
